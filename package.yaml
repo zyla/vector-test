@@ -1,0 +1,21 @@
+name:                vector-test
+version:             0.1.0.0
+license:             BSD3
+author:              "Author name here"
+maintainer:          "example@example.com"
+copyright:           "2018 Author name here"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+dependencies:
+- base >= 4.7 && < 5
+- pretty-show
+- persistent-vector
+- QuickCheck
+
+executables:
+  vector-test:
+    main:                Main.hs
+    source-dirs:         app
