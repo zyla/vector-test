@@ -3,11 +3,15 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
 
-{-# OPTIONS_GHC -Wincomplete-patterns #-}
+{-# OPTIONS_GHC -Wno-everything -Wincomplete-patterns #-}
 
 module Main where
 
+import Control.Monad
 import Data.Foldable
 import Data.Maybe
 import Data.Monoid
@@ -16,7 +20,10 @@ import Test.QuickCheck
 import qualified Data.List as L
 import qualified Data.Vector.Persistent as PV
 import qualified Data.Vector as V
+import qualified OldVector as PV0
 import Text.Show.Pretty
+import Debug.Trace
+import System.Exit
 
 type T = Int
 
@@ -32,6 +39,7 @@ data Expr a where
   -- foldl' :: (b -> a -> b) -> b -> Vector a -> b
   -- foldr :: (a -> b -> b) -> b -> Vector a -> b
   FromList :: [T] -> Expr [T]
+  FromRange :: Int -> Expr [T]
   Index :: Expr [T] -> Int -> Expr T
   -- length :: Vector a -> Int
   -- map :: (a -> b) -> Vector a -> Vector b
@@ -89,49 +97,55 @@ listGen
 listGen env 0 =
   oneof $
     [ pure Empty
-    , FromList <$> arbitrary
+--    , FromList <$> arbitrary
+    , FromRange <$> sized (\size -> choose (1, size))
     ] ++
     [ Var <$> range (length env) | not (null env) ]
 listGen env parentSize =
   let size = parentSize `div` 2 in
-  oneof
+  frequency
     -- Drop
-    [ do xs <- listGen env size
-         ix <- choose (0, exprLen env xs)
-         pure (Drop ix xs)
+    [ (1, do xs <- listGen env size
+             ix <- choose (0, exprLen env xs)
+             pure (Drop ix xs))
 
-    , Reverse <$> listGen env size
-    , Shrink <$> listGen env size
-    , Singleton <$> valGen env size
+    , (0, Reverse <$> listGen env size)
+    , (0, Shrink <$> listGen env size)
+    , (0, Singleton <$> valGen env size)
 
     -- Slice
-    , do xs <- listGen env size
-         let len = exprLen env xs
-         if len == 0 then listGen env size else do
-           end <- choose (1, len)
-           start <- range end
-           pure (Slice start (end-start) xs)
+    , (0, do xs <- listGen env size
+             let len = exprLen env xs
+             if len == 0 then listGen env size else do
+               end <- choose (1, len)
+               start <- range end
+               pure (Slice start (end-start) xs))
     
-    , Snoc <$> listGen env size <*> valGen env size
+    , (0, Snoc <$> listGen env size <*> valGen env size)
 
     -- Take
-    , do xs <- listGen env size
-         ix <- choose (0, exprLen env xs)
-         pure (Take ix xs)
+    , (1, do xs <- listGen env size
+             ix <- choose (0, exprLen env xs)
+             pure (Take ix xs))
 
     -- Update
-    , do xs <- listGen env size
-         let len = exprLen env xs
-         if len == 0 then listGen env size else do
-           ix <- range (exprLen env xs)
-           x <- valGen env size
-           pure (Update ix x xs)
+    , (0, do xs <- listGen env size
+             let len = exprLen env xs
+             if len == 0 then listGen env size else do
+               ix <- range (exprLen env xs)
+               x <- valGen env size
+               pure (Update ix x xs))
 
-    , Append <$> listGen env size <*> listGen env size
-    , do
-        val <- listGen env size
-        body <- listGen (interpList env val : env) size
-        pure (Let val body)
+    -- Append
+    , (0, Append <$> listGen env size <*> listGen env size)
+
+    -- Let
+    , (0, do val <- listGen env size
+             body <- listGen (interpList env val : env) size
+             pure (Let val body))
+
+    -- leaf
+    , (1, listGen env 0)
     ]
 
 valGen :: [[T]] -> Int -> Gen (Expr T)
@@ -156,6 +170,7 @@ interpList env0 = go env0
       Drop n xs -> L.drop n (go env xs)
       Empty -> []
       FromList xs -> xs
+      FromRange n -> [0..n-1]
       Snoc xs x ->
         -- BUG go env x : go env xs
         go env xs ++ [go env x]
@@ -180,24 +195,68 @@ type family InterpPV a where
   InterpPV [a] = PV.Vector (InterpPV a)
   InterpPV a = a
 
-interpPV :: [PV.Vector T] -> Expr a -> InterpPV a
+type Show' a = (Show a, Show (InterpPV a))
+
+interpPV :: Show' a => [PV.Vector T] -> Expr a -> InterpPV a
 interpPV env0 = go env0
   where
-    go :: [PV.Vector T] -> Expr a -> InterpPV a
-    go env = \case
+    go :: Show' a => [PV.Vector T] -> Expr a -> InterpPV a
+    go env expr =
+      let !y = go' env expr
+      in
+        trace ("--\n" <> show expr <> "\n -> " <> show y <> "\n--")
+        y
+
+    go' :: Show' a => [PV.Vector T] -> Expr a -> InterpPV a
+    go' env = \case
       Const n -> n
       Drop n xs -> PV.drop n (go env xs)
       Empty -> PV.empty
       FromList xs -> PV.fromList xs
+      FromRange n -> PV.fromList [0..n-1]
       Snoc xs x -> go env xs `PV.snoc` go env x
       Append xs ys -> go env xs <> go env ys
-      Index xs i -> fromMaybe (error ("Invalid index: " <> show i)) $ go env xs `PV.index` i
+      Index xs i ->
+        let vec = go env xs
+        in fromMaybe (error ("Invalid index: " <> show i <> "\nvector: " <> show vec)) $ vec `PV.index` i
       Reverse xs -> PV.reverse (go env xs)
       Shrink xs -> go env xs
       Singleton x -> PV.singleton (go env x)
       Slice start len xs -> PV.slice start len $ go env xs
       Take n xs -> PV.take n $ go env xs
       Update i x xs -> PV.update i (go env x) (go env xs)
+
+      Let x y -> go (go env x : env) y
+      Var n -> env !! n
+
+type family InterpPV0 a where
+  InterpPV0 [a] = PV0.Vector (InterpPV0 a)
+  InterpPV0 a = a
+
+interpPV0 :: [PV0.Vector T] -> Expr a -> InterpPV0 a
+interpPV0 env0 = go env0
+  where
+    go :: [PV0.Vector T] -> Expr a -> InterpPV0 a
+    go env expr = go' env expr
+
+    go' :: [PV0.Vector T] -> Expr a -> InterpPV0 a
+    go' env = \case
+      Const n -> n
+      Drop n xs -> PV0.drop n (go env xs)
+      Empty -> PV0.empty
+      FromList xs -> PV0.fromList xs
+      FromRange n -> PV0.fromList [0..n-1]
+      Snoc xs x -> go env xs `PV0.snoc` go env x
+      Append xs ys -> go env xs <> go env ys
+      Index xs i ->
+        let vec = go env xs
+        in fromMaybe (error ("Invalid index: " <> show i <> "\nvector: " <> show vec)) $ vec `PV0.index` i
+      Reverse xs -> PV0.reverse (go env xs)
+      Shrink xs -> go env xs
+      Singleton x -> PV0.singleton (go env x)
+      Slice start len xs -> PV0.slice start len $ go env xs
+      Take n xs -> PV0.take n $ go env xs
+      Update i x xs -> PV0.update i (go env x) (go env xs)
 
       Let x y -> go (go env x : env) y
       Var n -> env !! n
@@ -215,6 +274,7 @@ interpVector env0 = go env0
       Drop n xs -> V.drop n (go env xs)
       Empty -> V.empty
       FromList xs -> V.fromList xs
+      FromRange n -> V.fromList [0..n-1]
       Snoc xs x -> go env xs `V.snoc` go env x
       Append xs ys -> go env xs <> go env ys
       Index xs i -> go env xs V.! i
@@ -230,8 +290,15 @@ interpVector env0 = go env0
 
 example :: Expr [T] -> IO ()
 example expr = do
-  print $ interpList [] expr
-  print $ toList $ interpPV [] expr
+  let l = interpList [] expr
+  let v = toList $ interpPV [] expr
+  let !_ = show v
+  putStrLn ("list: " <> show l)
+  putStrLn ("SUT:  " <> show v)
+  putStrLn ("PV0:  " <> show (toList $ interpPV0 [] expr))
+  when (l /= v) $ do
+    putStrLn $ "FAILED: " <> show expr
+    exitWith (ExitFailure 1)
 
 prop_modelsMatch :: (Expr [T] -> [T]) -> Property
 prop_modelsMatch interp =
@@ -242,6 +309,7 @@ prop_modelsMatch interp =
     in
     counterexample ("list: " <> show l) $
     counterexample ("SUT:  " <> show v) $
+    counterexample ("PV0:  " <> show (toList $ interpPV0 [] expr)) $
     l === v
 
 prop_PV_ok :: Property
@@ -250,33 +318,19 @@ prop_PV_ok = prop_modelsMatch (toList . interpPV [])
 prop_Vector_ok :: Property
 prop_Vector_ok = prop_modelsMatch (V.toList . interpVector [])
 
-ex1 =
-  Snoc
-    (Slice
-       5
-       1
-       (Snoc
-          (Take
-             12
-             (Drop
-                3
-                (Drop
-                   25 -- removing 1 here gives correct answer
-                   (FromList [ 1, 1, 1, 1, 1, 26 , -46 , -44 , 4 , -33 , -3 , 31 , 40 , 40 , -34 , 8 , 3 , -19 , -42 , -20 , -39 , -36 , 18 , -20 , 25 , 41 , -12 , 1 , -17 , -31 , 34 , -45 , -11 , 47 , -31 , -11 , -31 , -1 , -42 , 32 , 4 , -18 ]))))
-          (Index
-             (Singleton
-                (Index
-                   (FromList [ 14 , -16 , -24 , 5 , -14 , 26 , -25 , 24 , -11 , -36 , 40 , -39 , -17 , 4 , 13 , 4 , -27 , -7 , -36 , 6 , -3 , 19 , -3 , -22 , -31 , -10 , 13 , 46 ])
-                   14))
-             0)))
-    (Const 45)
-
 _Snoc xs x = xs
 _Drop n xs = xs
 _Take n xs = xs
 _Slice _ _ xs = xs
 
-ex2 = Slice 5 1 (Drop 28 (FromList [ 1..40 ]))
+ex2 = Slice 5 1 $ Drop 28 $ FromList [ 1..40 ]
+
+ex3 = Drop 1 $ Take 2 $ FromList [0..32]
+
+ex4 = Drop 33 $ Drop 31 $ FromRange 34
 
 main :: IO ()
-main = example ex2
+main = do
+  example ex2
+--  example ex3
+--  example ex4
