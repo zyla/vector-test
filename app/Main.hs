@@ -15,6 +15,7 @@ import GHC.TypeLits
 import Test.QuickCheck
 import qualified Data.List as L
 import qualified Data.Vector.Persistent as PV
+import qualified Data.Vector as V
 import Text.Show.Pretty
 
 type T = Int
@@ -175,14 +176,14 @@ listUpdate n x [] = []
 listUpdate 0 x (_:xs) = x:xs
 listUpdate n x (y:xs) = y : listUpdate (n-1) x xs
 
-type family InterpVector a where
-  InterpVector [a] = PV.Vector (InterpVector a)
-  InterpVector a = a
+type family InterpPV a where
+  InterpPV [a] = PV.Vector (InterpPV a)
+  InterpPV a = a
 
-interpVector :: [PV.Vector T] -> Expr a -> InterpVector a
-interpVector env0 = go env0
+interpPV :: [PV.Vector T] -> Expr a -> InterpPV a
+interpPV env0 = go env0
   where
-    go :: [PV.Vector T] -> Expr a -> InterpVector a
+    go :: [PV.Vector T] -> Expr a -> InterpPV a
     go env = \case
       Const n -> n
       Drop n xs -> PV.drop n (go env xs)
@@ -201,22 +202,53 @@ interpVector env0 = go env0
       Let x y -> go (go env x : env) y
       Var n -> env !! n
 
+type family InterpVector a where
+  InterpVector [a] = V.Vector (InterpVector a)
+  InterpVector a = a
+
+interpVector :: [V.Vector T] -> Expr a -> InterpVector a
+interpVector env0 = go env0
+  where
+    go :: [V.Vector T] -> Expr a -> InterpVector a
+    go env = \case
+      Const n -> n
+      Drop n xs -> V.drop n (go env xs)
+      Empty -> V.empty
+      FromList xs -> V.fromList xs
+      Snoc xs x -> go env xs `V.snoc` go env x
+      Append xs ys -> go env xs <> go env ys
+      Index xs i -> go env xs V.! i
+      Reverse xs -> V.reverse (go env xs)
+      Shrink xs -> go env xs
+      Singleton x -> V.singleton (go env x)
+      Slice start len xs -> V.slice start len $ go env xs
+      Take n xs -> V.take n $ go env xs
+      Update i x xs -> V.update (go env xs) (V.fromList [(i, go env x)])
+
+      Let x y -> go (go env x : env) y
+      Var n -> env !! n
+
 example :: Expr [T] -> IO ()
 example expr = do
   print $ interpList [] expr
-  print $ toList $ interpVector [] expr
+  print $ toList $ interpPV [] expr
 
-prop_modelsMatch :: Property
-prop_modelsMatch =
+prop_modelsMatch :: (Expr [T] -> [T]) -> Property
+prop_modelsMatch interp =
   forAll (sized (listGen [])) $ \expr ->
     counterexample (ppShow expr) $
     let l = interpList [] expr
-        v = toList (interpVector [] expr)
+        v = interp expr
     in
-    counterexample ("list:   " <> show l) $
-    counterexample ("vector: " <> show v) $
+    counterexample ("list: " <> show l) $
+    counterexample ("SUT:  " <> show v) $
     l === v
 
+prop_PV_ok :: Property
+prop_PV_ok = prop_modelsMatch (toList . interpPV [])
+
+prop_Vector_ok :: Property
+prop_Vector_ok = prop_modelsMatch (V.toList . interpVector [])
 
 ex1 =
   Snoc

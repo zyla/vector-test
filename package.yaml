@@ -14,6 +14,7 @@ dependencies:
 - pretty-show
 - persistent-vector
 - QuickCheck
+- vector
 
 executables:
   vector-test:
